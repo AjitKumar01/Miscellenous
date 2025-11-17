@@ -5,6 +5,23 @@ TvlSim Booking Data Extractor
 Extracts booking information from simulation log files and generates
 structured data files for demand forecasting analysis.
 
+Log Format Reference (from TvlSim source code):
+-----------------------------------------------
+1. Booking Request (DEBUG level):
+   "[DEBUG] Poped booking request: 'Origin: XXX, Destination: YYY, ...'"
+   
+   Contains: Origin, Destination, Cabin, Party Size, WTP, Channel, POS, dates
+
+2. Confirmed Booking (NOTIFICATION level):
+   "[NOTIFICATION] AIRLINE1FLIGHT1/ORIGIN1-DEST1/CLASS1;AIRLINE2FLIGHT2/ORIGIN2-DEST2/CLASS2;DTD"
+   
+   Example: "BA9/LHR-SYD/Y;QF15/SYD-BKK/Q;45.5"
+   - Segments separated by semicolons
+   - Each segment: AIRLINE_CODE+FLIGHT_NUM/ORIGIN-DEST/BOOKING_CLASS
+   - Last value: DTD (Days To Departure) as decimal
+
+3. Date Format: YYYY-Mon-DD (e.g., 2011-Jan-10)
+
 Usage:
     python3 extract_bookings.py --log simulate.log --output bookings.csv
 """
@@ -31,22 +48,34 @@ class BookingExtractor:
         print(f"📖 Reading log file: {self.log_file}")
         
         booking_count = 0
+        notification_count = 0
         cancellation_count = 0
         
         try:
             with open(self.log_file, 'r', encoding='utf-8', errors='ignore') as f:
                 for line_num, line in enumerate(f, 1):
-                    # Extract booking requests
-                    if 'booking request' in line.lower() or 'poped booking request' in line.lower():
+                    # Extract booking requests from DEBUG logs
+                    # Format: "[DEBUG] Poped booking request: '...'"
+                    if 'poped booking request' in line.lower():
+                        booking_data = self._parse_booking_request(line, line_num)
+                        if booking_data:
+                            booking_count += 1
+                    
+                    # Also catch general booking request mentions
+                    elif 'booking request' in line.lower() and 'poped' not in line.lower():
                         booking_data = self._parse_booking_request(line, line_num)
                         if booking_data:
                             booking_count += 1
                             
                     # Extract successful bookings/sales (NOTIFICATION level)
-                    elif 'NOTIFICATION' in line and ('/' in line or 'segment' in line.lower()):
-                        sale_data = self._parse_sale_notification(line, line_num)
-                        if sale_data:
-                            self._merge_sale_with_booking(sale_data)
+                    # Format: "[NOTIFICATION] SEGMENT1;SEGMENT2;...;DTD"
+                    elif 'NOTIFICATION' in line:
+                        # Check if it contains segment paths (has / and -)
+                        if '/' in line and '-' in line:
+                            sale_data = self._parse_sale_notification(line, line_num)
+                            if sale_data:
+                                self._merge_sale_with_booking(sale_data)
+                                notification_count += 1
                             
                     # Extract cancellations
                     elif 'cancellation' in line.lower():
@@ -62,56 +91,101 @@ class BookingExtractor:
             sys.exit(1)
             
         print(f"✅ Parsing complete: {len(self.bookings)} bookings extracted")
-        print(f"   - Booking requests: {booking_count}")
+        print(f"   - Booking requests (DEBUG): {booking_count}")
+        print(f"   - Confirmed sales (NOTIFICATION): {notification_count}")
         print(f"   - Cancellations: {cancellation_count}")
         
     def _parse_booking_request(self, line, line_num):
-        """Parse a booking request line from the log."""
+        """Parse a booking request line from the log.
+        
+        Actual format from TvlSim logs:
+        "Poped booking request: 'At YYYY-Mon-DD HH:MM:SS.ffffff, for (ORIGIN, CHANNEL) 
+         ORIGIN-DEST (TRIP_TYPE) YYYY-Mon-DD (STAY_DAYS days) HH:MM:SS CABIN PARTY_SIZE 
+         FF_STATUS WTP VALUE1 VALUE2 VALUE3 VALUE4 VALUE5'"
+        
+        Example:
+        "At 2009-Jan-07 05:52:03.751000, for (SIN, IN) SIN-BKK (RO) 2009-Feb-09 
+         (0 days) 19:06:29 Y 1 N 310.641 52.9515 0 50 0 50"
+        """
         booking = {
             'line_number': line_num,
-            'timestamp': self._extract_timestamp(line),
             'request_type': 'booking',
             'status': 'requested'
         }
         
-        # Extract origin-destination
-        od_pattern = r'Origin:\s*([A-Z]{3})[,\s]+Destination:\s*([A-Z]{3})'
-        od_match = re.search(od_pattern, line)
-        if od_match:
-            booking['origin'] = od_match.group(1)
-            booking['destination'] = od_match.group(2)
-            
-        # Extract dates
-        date_pattern = r'(\d{4}-\w{3}-\d{2})'
-        dates = re.findall(date_pattern, line)
-        if dates:
-            booking['preferred_departure_date'] = dates[0] if len(dates) > 0 else None
-            booking['request_date'] = dates[1] if len(dates) > 1 else None
-            
-        # Extract party size
-        party_pattern = r'Party[- ]?size:\s*(\d+)'
-        party_match = re.search(party_pattern, line, re.IGNORECASE)
-        if party_match:
-            booking['party_size'] = int(party_match.group(1))
+        # Extract the part after "Poped booking request: '"
+        request_match = re.search(r"Poped booking request:\s*['\"](.+?)['\"]", line, re.IGNORECASE)
+        if not request_match:
+            return None
         
-        # Extract cabin/class
-        cabin_pattern = r'Cabin:\s*(\w+)'
-        cabin_match = re.search(cabin_pattern, line, re.IGNORECASE)
-        if cabin_match:
-            booking['cabin'] = cabin_match.group(1)
-            
-        # Extract WTP (Willingness to Pay)
-        wtp_pattern = r'WTP[:\s]+([0-9.]+)'
-        wtp_match = re.search(wtp_pattern, line, re.IGNORECASE)
-        if wtp_match:
-            booking['wtp'] = float(wtp_match.group(1))
-            
-        # Extract channel
-        channel_pattern = r'Channel:\s*(\w+)'
-        channel_match = re.search(channel_pattern, line, re.IGNORECASE)
-        if channel_match:
-            booking['channel'] = channel_match.group(1)
-            
+        request_content = request_match.group(1)
+        
+        # Extract timestamp: "At YYYY-Mon-DD HH:MM:SS.ffffff"
+        timestamp_pattern = r'At\s+(\d{4}-[A-Z][a-z]{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)'
+        timestamp_match = re.search(timestamp_pattern, request_content, re.IGNORECASE)
+        if timestamp_match:
+            booking['request_datetime'] = timestamp_match.group(1)
+            booking['timestamp'] = timestamp_match.group(1)
+        
+        # Extract origin and channel: "for (ORIGIN, CHANNEL)"
+        origin_channel_pattern = r'for\s+\(([A-Z]{3}),\s*([A-Z]{2})\)'
+        oc_match = re.search(origin_channel_pattern, request_content)
+        if oc_match:
+            booking['origin'] = oc_match.group(1)
+            booking['pos'] = oc_match.group(1)  # POS is same as origin
+            booking['channel'] = oc_match.group(2)
+        
+        # Extract route: "ORIGIN-DEST (TRIP_TYPE)"
+        route_pattern = r'([A-Z]{3})-([A-Z]{3})\s*\(([A-Z]{2,})\)'
+        route_match = re.search(route_pattern, request_content)
+        if route_match:
+            booking['origin'] = route_match.group(1)
+            booking['destination'] = route_match.group(2)
+            booking['trip_type'] = route_match.group(3)  # RO=Round trip, OW=One way, etc.
+        
+        # Extract departure date: YYYY-Mon-DD after the route
+        # Look for dates that are not the request date
+        date_pattern = r'(\d{4}-[A-Z][a-z]{2}-\d{2})'
+        dates = re.findall(date_pattern, request_content, re.IGNORECASE)
+        if len(dates) >= 2:
+            booking['preferred_departure_date'] = dates[1]  # Second date is departure
+        elif len(dates) == 1:
+            booking['preferred_departure_date'] = dates[0]
+        
+        # Extract stay duration: "(N days)"
+        stay_pattern = r'\((\d+)\s+days?\)'
+        stay_match = re.search(stay_pattern, request_content, re.IGNORECASE)
+        if stay_match:
+            booking['stay_duration'] = int(stay_match.group(1))
+        
+        # Extract departure time: HH:MM:SS
+        time_pattern = r'(\d{2}:\d{2}:\d{2})\s+([YJF])\s+(\d+)'
+        time_match = re.search(time_pattern, request_content)
+        if time_match:
+            booking['preferred_departure_time'] = time_match.group(1)
+            booking['cabin'] = time_match.group(2)
+            booking['party_size'] = int(time_match.group(3))
+        
+        # Extract remaining fields by position after party size
+        # Format: CABIN PARTY_SIZE FF_STATUS WTP DISUTILITY VALUE3 VALUE4 VALUE5 VALUE6
+        values_pattern = r'([YJF])\s+(\d+)\s+([YN])\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)'
+        values_match = re.search(values_pattern, request_content)
+        if values_match:
+            booking['cabin'] = values_match.group(1)
+            booking['party_size'] = int(values_match.group(2))
+            booking['frequent_flyer'] = values_match.group(3)
+            booking['wtp'] = float(values_match.group(4))
+            booking['time_value'] = float(values_match.group(5))
+            booking['dtd_0'] = float(values_match.group(6))
+            booking['dtd_7'] = float(values_match.group(7))
+            booking['dtd_14'] = float(values_match.group(8))
+            booking['dtd_21'] = float(values_match.group(9))
+        
+        # Map cabin codes to names
+        if 'cabin' in booking:
+            cabin_map = {'Y': 'Economy', 'J': 'Business', 'F': 'First'}
+            booking['cabin_name'] = cabin_map.get(booking['cabin'], booking['cabin'])
+        
         # Only add if we have meaningful data
         if 'origin' in booking and 'destination' in booking:
             self.bookings.append(booking)
@@ -120,40 +194,96 @@ class BookingExtractor:
         return None
         
     def _parse_sale_notification(self, line, line_num):
-        """Parse a sale notification (successful booking) from the log."""
+        """Parse a sale notification (successful booking) from the log.
+        
+        Format from Simulator.cpp:
+        STDAIR_LOG_NOTIFICATION (oStr.str() << std::setprecision(10) << lDTD);
+        
+        Where oStr contains segment paths like: "BA9/LHR-SYD/Y;QF15/SYD-BKK/Q;"
+        Followed by DTD (days to departure) as a decimal number.
+        
+        Segment format: AIRLINE_CODE+FLIGHT_NUM/ORIGIN-DEST/BOOKING_CLASS
+        """
         sale = {
             'line_number': line_num,
             'timestamp': self._extract_timestamp(line),
             'status': 'confirmed'
         }
         
-        # Extract flight segments (e.g., "BA10/LHR-CDG/Y")
-        segment_pattern = r'([A-Z0-9]{2,3}\d+)/([A-Z]{3})-([A-Z]{3})/([A-Z])'
-        segments = re.findall(segment_pattern, line)
+        # Extract the NOTIFICATION part (after the log level)
+        notif_pattern = r'NOTIFICATION[:\s]+(.+)'
+        notif_match = re.search(notif_pattern, line)
+        if not notif_match:
+            return None
+            
+        notification_content = notif_match.group(1).strip()
         
-        if segments:
-            sale['segments'] = []
-            for seg in segments:
+        # Split by semicolon to get segments and DTD
+        # Format: "segment1;segment2;...;DTD_value"
+        parts = notification_content.split(';')
+        
+        # Last part should be DTD (Days To Departure)
+        if len(parts) >= 2:
+            try:
+                # Try to parse the last part as DTD
+                dtd_value = parts[-1].strip()
+                if dtd_value:  # Not empty after last semicolon
+                    sale['days_to_departure'] = float(dtd_value)
+                    # Remove DTD from parts list
+                    segment_parts = parts[:-1]
+                else:
+                    # Empty after last semicolon, DTD might be second to last
+                    segment_parts = parts[:-1]
+                    if segment_parts:
+                        try:
+                            sale['days_to_departure'] = float(segment_parts[-1].strip())
+                            segment_parts = segment_parts[:-1]
+                        except ValueError:
+                            pass
+            except ValueError:
+                # If last part is not a number, treat all as segments
+                segment_parts = parts
+        else:
+            segment_parts = parts
+        
+        # Parse each segment
+        # Segment format: AIRLINE_CODE+FLIGHT_NUM/ORIGIN-DEST/BOOKING_CLASS
+        # Examples: "BA9/LHR-SYD/Y", "QF15/SYD-BKK/Q", "SQ11/SIN-LHR/F"
+        segment_pattern = r'([A-Z0-9]{2,})/([A-Z]{3})-([A-Z]{3})/([A-Z])'
+        
+        sale['segments'] = []
+        for part in segment_parts:
+            part = part.strip()
+            if not part:
+                continue
+            seg_match = re.search(segment_pattern, part)
+            if seg_match:
                 sale['segments'].append({
-                    'flight': seg[0],
-                    'origin': seg[1],
-                    'destination': seg[2],
-                    'booking_class': seg[3]
+                    'flight': seg_match.group(1),
+                    'origin': seg_match.group(2),
+                    'destination': seg_match.group(3),
+                    'booking_class': seg_match.group(4)
                 })
+        
+        # Set overall origin and destination from segments
+        if sale['segments']:
+            sale['origin'] = sale['segments'][0]['origin']
+            sale['destination'] = sale['segments'][-1]['destination']
+            sale['flight_path'] = ' -> '.join([f"{s['flight']}" for s in sale['segments']])
+            sale['num_segments'] = len(sale['segments'])
             
-            # First segment origin and last segment destination
-            if sale['segments']:
-                sale['origin'] = sale['segments'][0]['origin']
-                sale['destination'] = sale['segments'][-1]['destination']
-                sale['flight_path'] = ' -> '.join([f"{s['flight']}" for s in sale['segments']])
-                
-        # Extract DTD (Days To Departure)
-        dtd_pattern = r'[-+]?\d+\.\d+$'
-        dtd_match = re.search(dtd_pattern, line.strip())
-        if dtd_match:
-            sale['days_to_departure'] = float(dtd_match.group(0))
+            # Extract cabin from first segment booking class
+            booking_class = sale['segments'][0]['booking_class']
+            if booking_class in ['Y', 'M', 'B', 'H', 'Q', 'K', 'L', 'T', 'E']:
+                sale['cabin'] = 'Economy'
+            elif booking_class in ['J', 'C', 'D', 'Z', 'I']:
+                sale['cabin'] = 'Business'
+            elif booking_class in ['F', 'A', 'P']:
+                sale['cabin'] = 'First'
+            else:
+                sale['cabin'] = 'Economy'  # Default
             
-        return sale if 'segments' in sale else None
+        return sale if 'segments' in sale and len(sale['segments']) > 0 else None
         
     def _merge_sale_with_booking(self, sale_data):
         """Merge sale data with the most recent matching booking request."""
@@ -174,16 +304,27 @@ class BookingExtractor:
         self.statistics['successful_bookings'] += 1
         
     def _extract_timestamp(self, line):
-        """Extract timestamp from log line."""
+        """Extract timestamp from log line.
+        
+        StdAir log format examples:
+        - [DEBUG] or [NOTIFICATION] at start
+        - May have datetime in format: YYYY-MM-DD HH:MM:SS
+        - May have date format: YYYY-Mon-DD
+        """
         # Common log timestamp patterns
         patterns = [
-            r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
-            r'\[(\d{4}-\w{3}-\d{2}\s+\d{2}:\d{2}:\d{2})\]',
-            r'(\d{2}:\d{2}:\d{2}\.\d+)',
+            # ISO format: 2011-01-10 14:30:00
+            r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)',
+            # StdAir date format: 2011-Jan-10 14:30:00
+            r'(\d{4}-[A-Z][a-z]{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?)',
+            # In brackets: [2011-Jan-10 14:30:00]
+            r'\[(\d{4}-[A-Z][a-z]{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\]',
+            # Time only: 14:30:00.123
+            r'(\d{2}:\d{2}:\d{2}(?:\.\d+)?)',
         ]
         
         for pattern in patterns:
-            match = re.search(pattern, line)
+            match = re.search(pattern, line, re.IGNORECASE)
             if match:
                 return match.group(1)
         return None
@@ -301,12 +442,14 @@ class BookingExtractor:
         print(f"💾 Exporting demand forecast format: {output_file}")
         
         # Aggregate bookings by date, route, and cabin
-        demand_data = defaultdict(lambda: {
-            'count': 0, 
-            'total_passengers': 0,
-            'avg_wtp': [],
-            'avg_dtd': []
-        })
+        def create_demand_entry():
+            return {
+                'count': 0, 
+                'total_passengers': 0,
+                'avg_wtp': [],
+                'avg_dtd': []
+            }
+        demand_data = defaultdict(create_demand_entry)
         
         for booking in self.bookings:
             if booking.get('status') != 'confirmed':
